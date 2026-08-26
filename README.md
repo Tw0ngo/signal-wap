@@ -11,7 +11,10 @@ Signal-CLI Bridge for WAP Browsers, tested on a Nokia 7110
 5. Run `npm install` to install dependencies
 6. Copy `.env.example` to `.env` and edit it
 7. Set the password and port in your `.env` file
-8. Run `npm start` to launch signal-wap
+8. Fix file permissions (if needed):
+   ```bash
+   sudo chown -R $USER:$USER
+9. Run `npm start` to launch signal-wap
 
 ## Notes
 - Groupchats may still be broken
