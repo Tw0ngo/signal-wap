@@ -291,7 +291,7 @@ app.get('/messages', checkAuth, async (req, res) => {
     const msgs = messages.slice(-5).reverse().map(m => {
         const sender = m.senderId === 'Me' ? 'Me' : sanitizeText(getResolvedName(m.senderId)).substring(0, 8);
         const time = new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        return `<u>${sender} ${time}</u><br/>${sanitizeText(m.text).substring(0, 40)}<br/><br/>`;
+        return `<u>${sender} ${time}</u><br/>${sanitizeText(m.text).substring(0, 200)}<br/><br/>`;
     }).join('');
 
     res.send(`<?xml version="1.0"?><!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml"><wml><card id="msgs" title="Chat"><p><a href="/compose?id=${encodeURIComponent(contactId)}">[ Write ]</a><br/><br/>${msgs || '<em>No messages in history.</em>'}<br/><br/><anchor>&#xab; Back<go href="/chats" method="get"/></anchor></p></card></wml>`);
