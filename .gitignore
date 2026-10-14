@@ -1,0 +1,5 @@
+node_modules/
+.env
+messages_store.json
+state.json
+*.tmp

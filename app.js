@@ -1,330 +1,614 @@
 /**
  * Signal WAP - Signal-CLI Bridge for WAP Browsers
- * Tested on Nokia 7110
+ * Tested on Nokia 7110 (WML 1.1, ~1.4 KB compiled deck limit, no cookies)
+ *
+ * Talks to one long-running `signal-cli jsonRpc` process over stdin/stdout:
+ * no shell, no JVM start per request, messages arrive as they come in.
  */
 
 const express = require('express');
-const { exec } = require('child_process');
+const { spawn } = require('child_process');
+const readline = require('readline');
+const crypto = require('crypto');
+const EventEmitter = require('events');
 const fs = require('fs');
 const path = require('path');
-const cookieParser = require('cookie-parser');
 require('dotenv').config();
 
-const app = express();
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-app.use(cookieParser());
+const PORT = parseInt(process.env.PORT || '8082', 10);
+const HOST = process.env.HOST || '127.0.0.1';
+const PASSWORD = process.env.SIGNAL_PASSWORD || '';
+const ACCOUNT = process.env.SIGNAL_ACCOUNT || '';
+const SIGNAL_CLI = process.env.SIGNAL_CLI || 'signal-cli';
+const SIGNAL_CONFIG = process.env.SIGNAL_CONFIG || '';
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const MAX_MESSAGES = parseInt(process.env.MAX_MESSAGES || '50', 10);
+const SESSION_DAYS = parseInt(process.env.SESSION_DAYS || '30', 10);
+const TZ = process.env.TZ || 'Europe/Berlin';
 
-const PORT = process.env.PORT || 8082;
-const PASSWORD = process.env.SIGNAL_PASSWORD || 'changeme';
-const CACHE_FILE = path.join(__dirname, 'chats_cache.json');
-const MSG_STORE_FILE = path.join(__dirname, 'messages_store.json');
-const CONTACTS_CACHE_FILE = path.join(__dirname, 'contacts_map.json');
+// The 7110 refuses compiled decks over ~1400 bytes. These budgets keep the
+// visible text of a deck well below that, leaving room for markup and URLs.
+const TEXT_BUDGET = parseInt(process.env.TEXT_BUDGET || '600', 10);
+const CHATS_PER_PAGE = 8;
+const NAME_LEN = 14;
 
-// ==================== Signal CLI Wrapper ====================
-
-function runSignalCli(command) {
-    return new Promise((resolve, reject) => {
-        exec(command, { maxBuffer: 1024 * 1024 * 2 }, (error, stdout, stderr) => {
-            if (error) {
-                reject(stderr || error.message);
-            } else {
-                resolve(stdout);
-            }
-        });
-    });
+if (!PASSWORD || PASSWORD === 'changeme') {
+    console.error('Set SIGNAL_PASSWORD in .env (not "changeme").');
+    process.exit(1);
 }
 
-// ==================== Helpers ====================
+const MSG_STORE_FILE = path.join(DATA_DIR, 'messages_store.json');
+const STATE_FILE = path.join(DATA_DIR, 'state.json');
 
-function sanitizeText(text) {
-    if (!text) return '';
+// ==================== Persistence ====================
+
+function loadJson(file, fallback) {
+    try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
+}
+
+function saveJson(file, data) {
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(data), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+}
+
+// messages_store.json keeps the original format: { chatId: [{senderId, text, timestamp}] }
+const store = loadJson(MSG_STORE_FILE, {});
+const state = Object.assign(
+    { shortIds: {}, nextShortId: 1, lastRead: {}, sessions: {} },
+    loadJson(STATE_FILE, {})
+);
+const longIds = {};
+for (const [id, s] of Object.entries(state.shortIds)) longIds[s] = id;
+
+let saveTimer = null;
+function scheduleSave() {
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+        saveTimer = null;
+        try {
+            saveJson(MSG_STORE_FILE, store);
+            saveJson(STATE_FILE, state);
+        } catch (e) {
+            console.error('[Store] save failed:', e.message);
+        }
+    }, 1000);
+}
+
+// Signal ids are 36-44 chars; a short number keeps URLs (and decks) small.
+function shortId(id) {
+    if (!state.shortIds[id]) {
+        const s = String(state.nextShortId++);
+        state.shortIds[id] = s;
+        longIds[s] = id;
+        scheduleSave();
+    }
+    return state.shortIds[id];
+}
+
+// ==================== Contacts ====================
+
+const contacts = {};      // id -> display name
+const uuidToNumber = {};  // uuid -> phone number
+const groupIds = new Set();
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// One chat per person, whether signal-cli reports their number or their uuid.
+function canonical(id) {
+    if (!id) return id;
+    return uuidToNumber[id] || id;
+}
+
+function displayName(id) {
+    if (!id) return 'Unknown';
+    if (id === 'Me') return 'Me';
+    const n = contacts[id] || contacts[canonical(id)];
+    if (n) return n;
+    return id.length > 12 ? id.substring(0, 8) + '..' : id;
+}
+
+// Messages that arrived before the contact list was loaded may sit under a uuid.
+function mergeAliases() {
+    for (const [uuid, number] of Object.entries(uuidToNumber)) {
+        if (store[uuid]) {
+            for (const m of store[uuid]) {
+                storeMessage(number, m.senderId === uuid ? number : m.senderId, m.text, m.timestamp, m.q);
+            }
+            delete store[uuid];
+            state.lastRead[number] = Math.max(state.lastRead[number] || 0, state.lastRead[uuid] || 0);
+            delete state.lastRead[uuid];
+        }
+        if (state.shortIds[uuid] && !state.shortIds[number]) {
+            state.shortIds[number] = state.shortIds[uuid];
+        }
+        if (state.shortIds[uuid]) {
+            longIds[state.shortIds[uuid]] = number;
+            delete state.shortIds[uuid];
+        }
+        for (const list of Object.values(store)) {
+            for (const m of list) {
+                if (m.senderId === uuid) m.senderId = number;
+                if (m.q?.a === uuid) m.q.a = number;
+            }
+        }
+    }
+    scheduleSave();
+}
+
+async function refreshContacts() {
+    try {
+        const list = await signal.call('listContacts', {});
+        if (Array.isArray(list)) {
+            for (const c of list) {
+                const uuid = c.uuid || c.aci;
+                if (uuid && c.number) uuidToNumber[uuid] = c.number;
+                const name = c.name
+                    || [c.givenName, c.familyName].filter(Boolean).join(' ')
+                    || [c.profile?.givenName, c.profile?.familyName].filter(Boolean).join(' ')
+                    || c.profileName
+                    || c.username;
+                const id = c.number || uuid;
+                if (id && name) contacts[id] = ascii(name);
+            }
+        }
+        mergeAliases();
+    } catch (e) {
+        console.error('[Contacts]', e.message || e);
+    }
+    try {
+        const groups = await signal.call('listGroups', {});
+        if (Array.isArray(groups)) {
+            for (const g of groups) {
+                if (!g.id) continue;
+                groupIds.add(g.id);
+                contacts[g.id] = '#' + ascii(g.name || 'Group');
+            }
+        }
+    } catch (e) {
+        console.error('[Groups]', e.message || e);
+    }
+}
+
+// ==================== Text helpers ====================
+
+const CHAR_MAP = {
+    'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'Ä': 'Ae', 'Ö': 'Oe', 'Ü': 'Ue', 'ß': 'ss',
+    '€': 'EUR', '„': '"', '“': '"', '”': '"', '‘': "'", '’': "'", '‚': "'",
+    '–': '-', '—': '-', '…': '...', ' ': ' ',
+    '😂': ':D', '🤣': ':D', '😀': ':D', '😃': ':D', '😄': ':D', '😁': ':D',
+    '🙂': ':)', '😊': ':)', '☺': ':)', '😉': ';)', '😢': ":'(", '😭': ":'(",
+    '🙁': ':(', '☹': ':(', '😛': ':P', '😜': ';P', '😮': ':O', '😘': ':*',
+    '❤': '<3', '♥': '<3', '👍': '(y)', '👎': '(n)', '🙏': '(pray)',
+};
+const CHAR_RE = new RegExp(Object.keys(CHAR_MAP).join('|'), 'gu');
+
+// The 7110 only renders plain ASCII reliably.
+function ascii(text) {
+    if (text == null) return '';
     return String(text)
+        .replace(/[︎️‍]/g, '')
+        .replace(CHAR_RE, c => CHAR_MAP[c])
         .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .replace(/[^\x20-\x7E]/g, '?')
+        .replace(/[̀-ͯ]/g, '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/[^\x20-\x7E\n]+/gu, '?')
         .trim();
 }
 
-function getResolvedName(id) {
-    if (!id || id === 'Me') return id || 'Unknown';
-    try {
-        if (fs.existsSync(CONTACTS_CACHE_FILE)) {
-            const map = JSON.parse(fs.readFileSync(CONTACTS_CACHE_FILE, 'utf8'));
-            if (map[id]) return map[id];
-        }
-    } catch {}
-    return id.length > 10 ? id.substring(0, 8) + '...' : id;
+// Escape for WML text and attributes. `$` starts a WML variable, so it is doubled.
+function esc(text) {
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;')
+        .replace(/\$/g, '$$$$');
 }
 
-function storeMessage(targetId, senderId, text, timestamp) {
-    if (!text || typeof text !== 'string' || text.trim() === '' || !targetId) return;
+function escLines(text) {
+    return esc(text).replace(/\n/g, '<br/>');
+}
 
-    let store = {};
-    try {
-        if (fs.existsSync(MSG_STORE_FILE)) {
-            store = JSON.parse(fs.readFileSync(MSG_STORE_FILE, 'utf8'));
-        }
-    } catch {}
+function fmtTime(ts) {
+    const d = new Date(ts);
+    const opts = { timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false };
+    const day = { timeZone: TZ, day: '2-digit', month: '2-digit' };
+    const sameDay = d.toLocaleDateString('de-DE', day) === new Date().toLocaleDateString('de-DE', day);
+    return (sameDay ? '' : d.toLocaleDateString('de-DE', day) + ' ') + d.toLocaleTimeString('de-DE', opts);
+}
 
-    if (!store[targetId]) store[targetId] = [];
+// ==================== Message store ====================
 
-    const exists = store[targetId].some(m => m.timestamp === timestamp && m.text === text);
-    if (!exists) {
-        store[targetId].push({ senderId: senderId || 'Unknown', text, timestamp });
-        store[targetId].sort((a, b) => a.timestamp - b.timestamp);
-        if (store[targetId].length > 50) {
-            store[targetId] = store[targetId].slice(-50);
-        }
-        fs.writeFileSync(MSG_STORE_FILE, JSON.stringify(store, null, 2));
+function storeMessage(chatId, senderId, text, timestamp, quote) {
+    if (!chatId || !text || !String(text).trim()) return;
+    const list = store[chatId] || (store[chatId] = []);
+    if (list.some(m => m.timestamp === timestamp && m.text === text)) return;
+    const msg = { senderId: senderId || 'Unknown', text, timestamp };
+    if (quote) msg.q = quote;
+    list.push(msg);
+    list.sort((a, b) => a.timestamp - b.timestamp);
+    if (list.length > MAX_MESSAGES) list.splice(0, list.length - MAX_MESSAGES);
+    shortId(chatId);
+    scheduleSave();
+}
+
+function quoteOf(dm) {
+    if (!dm.quote) return undefined;
+    return {
+        a: canonical(dm.quote.authorNumber || dm.quote.authorUuid || dm.quote.author),
+        t: ascii(dm.quote.text || '').substring(0, 20),
+    };
+}
+
+function describe(dm) {
+    let text = '';
+    if (dm.message) text += dm.message;
+    if (dm.sticker) text += (text ? '\n' : '') + '[Sticker]';
+    for (const a of dm.attachments || []) {
+        const type = (a.contentType || '').split('/')[0];
+        const label = { image: 'Image', video: 'Video', audio: 'Voice' }[type] || 'File';
+        text += (text ? '\n' : '') + `[${label}]`;
+    }
+    return text;
+}
+
+function handleEnvelope(env) {
+    if (!env) return;
+    const source = canonical(env.sourceNumber || env.sourceUuid || env.source) || 'Unknown';
+    const ts = env.timestamp || Date.now();
+
+    const dm = env.dataMessage || env.editMessage?.dataMessage;
+    if (dm && !dm.reaction && !dm.remoteDelete) {
+        const text = describe(dm);
+        const chat = dm.groupInfo?.groupId || source;
+        if (text) storeMessage(chat, source, (env.editMessage ? '(edited) ' : '') + text, ts, quoteOf(dm));
+    }
+
+    const sent = env.syncMessage?.sentMessage;
+    if (sent && !sent.reaction && !sent.remoteDelete) {
+        const text = describe(sent);
+        const chat = sent.groupInfo?.groupId
+            || canonical(sent.destinationNumber || sent.destinationUuid || sent.destination);
+        if (text && chat) storeMessage(chat, 'Me', text, sent.timestamp || ts, quoteOf(sent));
     }
 }
 
-// ==================== Auth Middleware ====================
+// ==================== signal-cli JSON-RPC ====================
 
-function checkAuth(req, res, next) {
-    const providedPwd = req.query?.pwd || req.body?.pwd || req.cookies?.signal_pwd;
-
-    if (!providedPwd || providedPwd !== PASSWORD) {
-        res.setHeader('Content-Type', 'text/vnd.wap.wml');
-        return res.send(`<?xml version="1.0"?><!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml"><wml><card id="err" title="Login"><p>Session expired or incorrect password.<br/><br/><anchor>Login<go href="/" method="get"/></anchor></p></card></wml>`);
+class SignalRpc extends EventEmitter {
+    constructor() {
+        super();
+        this.nextId = 1;
+        this.pending = new Map();
+        this.proc = null;
     }
 
-    if (req.cookies?.signal_pwd !== PASSWORD) {
-        res.cookie('signal_pwd', PASSWORD, { maxAge: 1000 * 60 * 60 * 24 * 30, httpOnly: true });
+    start() {
+        const args = [];
+        if (SIGNAL_CONFIG) args.push('--config', SIGNAL_CONFIG);
+        if (ACCOUNT) args.push('-a', ACCOUNT);
+        args.push('jsonRpc');
+
+        console.log('[signal-cli] starting:', SIGNAL_CLI, args.join(' '));
+        const proc = spawn(SIGNAL_CLI, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+        this.proc = proc;
+
+        readline.createInterface({ input: proc.stdout }).on('line', line => this.onLine(line));
+        readline.createInterface({ input: proc.stderr }).on('line', line => console.error('[signal-cli]', line));
+
+        proc.on('error', e => console.error('[signal-cli] spawn failed:', e.message));
+        proc.on('exit', code => {
+            console.error(`[signal-cli] exited (${code}), restarting in 10s`);
+            this.proc = null;
+            for (const p of this.pending.values()) p.reject(new Error('signal-cli exited'));
+            this.pending.clear();
+            setTimeout(() => this.start(), 10000);
+        });
+        this.emit('start');
     }
 
+    onLine(line) {
+        let msg;
+        try { msg = JSON.parse(line); } catch { return; }
+        if (msg.id != null && this.pending.has(msg.id)) {
+            const p = this.pending.get(msg.id);
+            this.pending.delete(msg.id);
+            if (msg.error) p.reject(new Error(msg.error.message || 'signal-cli error'));
+            else p.resolve(msg.result);
+        } else if (msg.method === 'receive') {
+            const params = msg.params || {};
+            this.emit('envelope', params.envelope || params.result?.envelope);
+        }
+    }
+
+    call(method, params, timeoutMs = 60000) {
+        return new Promise((resolve, reject) => {
+            if (!this.proc) return reject(new Error('signal-cli not running'));
+            const id = this.nextId++;
+            const timer = setTimeout(() => {
+                this.pending.delete(id);
+                reject(new Error(`${method} timed out`));
+            }, timeoutMs);
+            this.pending.set(id, {
+                resolve: v => { clearTimeout(timer); resolve(v); },
+                reject: e => { clearTimeout(timer); reject(e); },
+            });
+            this.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params, id }) + '\n');
+        });
+    }
+}
+
+const signal = new SignalRpc();
+signal.on('envelope', env => {
+    try { handleEnvelope(env); } catch (e) { console.error('[receive]', e.message); }
+});
+signal.on('start', () => setTimeout(refreshContacts, 3000));
+setInterval(refreshContacts, 10 * 60 * 1000);
+
+// ==================== Sessions ====================
+// The 7110 (and many WAP gateways) drop cookies, so the session token
+// travels in the URL as ?s=...
+
+const failedLogins = [];
+
+function newSession() {
+    const token = crypto.randomBytes(6).toString('base64url');
+    state.sessions[token] = Date.now() + SESSION_DAYS * 86400000;
+    scheduleSave();
+    return token;
+}
+
+function validSession(token) {
+    const exp = token && state.sessions[token];
+    if (!exp) return false;
+    if (exp < Date.now()) {
+        delete state.sessions[token];
+        scheduleSave();
+        return false;
+    }
+    return true;
+}
+
+function passwordOk(pwd) {
+    const a = crypto.createHash('sha256').update(String(pwd || '')).digest();
+    const b = crypto.createHash('sha256').update(PASSWORD).digest();
+    return crypto.timingSafeEqual(a, b);
+}
+
+// ==================== WML ====================
+
+const HEAD = '<?xml version="1.0"?>\n<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">\n';
+
+function sendDeck(res, title, body, extra = '') {
+    res.set({
+        'Content-Type': 'text/vnd.wap.wml',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+    });
+    res.send(
+        HEAD +
+        '<wml><head><meta http-equiv="Cache-Control" content="max-age=0" forua="true"/></head>' +
+        `<card id="c" title="${esc(title)}">${extra}` +
+        '<do type="prev" label="Back"><prev/></do>' +
+        `<p>${body}</p></card></wml>`
+    );
+}
+
+// Build a URL with the session token; `&` is escaped for WML.
+function link(req, route, params = {}) {
+    const q = new URLSearchParams({ ...params, s: req.session });
+    return esc(`${route}?${q.toString()}`);
+}
+
+function a(href, label) {
+    return `<a href="${href}">${label}</a>`;
+}
+
+// ==================== App ====================
+
+const app = express();
+app.use(express.urlencoded({ extended: false }));
+
+function auth(req, res, next) {
+    const token = req.query.s || req.body?.s;
+    if (!validSession(token)) {
+        return sendDeck(res, 'Login', 'Session expired.<br/>' + a('/', 'Login'));
+    }
+    req.session = token;
     next();
 }
 
-// ==================== Background Cache Updater ====================
+app.get('/', (req, res) => {
+    sendDeck(res, 'Signal',
+        'Password:<br/><input name="pwd" type="password" format="*M" emptyok="false"/><br/>' +
+        '<anchor>Sign in<go href="/login" method="post"><postfield name="pwd" value="$(pwd)"/></go></anchor>');
+});
 
-let isUpdatingCache = false;
-
-async function updateChatsCache() {
-    if (isUpdatingCache) return;
-    isUpdatingCache = true;
-
-    try {
-        let contactMap = {};
-
-        // Load contacts
-        const contactsOutput = await runSignalCli('signal-cli --output=json listContacts').catch(() => '[]');
-        try {
-            const contacts = JSON.parse(contactsOutput);
-            if (Array.isArray(contacts)) {
-                contacts.forEach(c => {
-                    const identifier = c.number || c.aci;
-                    if (identifier) {
-                        contactMap[identifier] = sanitizeText(c.name || c.profileName || identifier);
-                    }
-                });
-            }
-        } catch {}
-
-        // Load groups
-        const groupsOutput = await runSignalCli('signal-cli --output=json listGroups').catch(() => '[]');
-        try {
-            const groups = JSON.parse(groupsOutput);
-            if (Array.isArray(groups)) {
-                groups.forEach(g => {
-                    if (g.id) {
-                        contactMap[g.id] = '[Group] ' + sanitizeText(g.name || 'Unnamed');
-                    }
-                    if (Array.isArray(g.members)) {
-                        g.members.forEach(m => {
-                            const mId = m.number || m.aci;
-                            if (mId && m.name && !contactMap[mId]) {
-                                contactMap[mId] = sanitizeText(m.name);
-                            }
-                        });
-                    }
-                });
-            }
-        } catch {}
-
-        fs.writeFileSync(CONTACTS_CACHE_FILE, JSON.stringify(contactMap, null, 2));
-
-        // Receive messages
-        const receiveOutput = await runSignalCli('signal-cli --output=json receive').catch(() => '');
-        if (receiveOutput) {
-            receiveOutput.split('\n').filter(l => l.trim()).forEach(line => {
-                try {
-                    const data = JSON.parse(line);
-                    const envelope = data.envelope || data;
-                    const source = envelope.sourceNumber || envelope.source || 'Unknown';
-                    const timestamp = envelope.timestamp || Date.now();
-                    let msgText = '';
-                    let groupId = null;
-
-                    if (envelope.dataMessage) {
-                        if (envelope.dataMessage.reaction) return;
-                        if (envelope.dataMessage.quote) {
-                            const quotedAuthor = getResolvedName(envelope.dataMessage.quote.authorNumber || envelope.dataMessage.quote.author);
-                            const quotedText = sanitizeText(envelope.dataMessage.quote.text || '').substring(0, 20);
-                            msgText = `[Replying to ${quotedAuthor}: "${quotedText}"]\n`;
-                        }
-                        msgText += envelope.dataMessage.message || '';
-                        if (envelope.dataMessage.groupInfo?.groupId) {
-                            groupId = envelope.dataMessage.groupInfo.groupId;
-                        }
-                    }
-
-                    if (msgText && msgText.trim()) {
-                        storeMessage(groupId || source, source, msgText, timestamp);
-                    }
-
-                    // Handle sent sync
-                    if (envelope.syncMessage?.sentMessage) {
-                        const sent = envelope.syncMessage.sentMessage;
-                        const dest = sent.destination || sent.destinationNumber;
-                        const syncGroupId = sent.groupInfo?.groupId;
-                        let sentText = sent.message || '';
-
-                        if (sent.quote) {
-                            const quotedAuthor = getResolvedName(sent.quote.authorNumber || sent.quote.author);
-                            const quotedText = sanitizeText(sent.quote.text || '').substring(0, 20);
-                            sentText = `[Replying to ${quotedAuthor}: "${quotedText}"]\n` + sentText;
-                        }
-
-                        if (sentText.trim()) {
-                            storeMessage(syncGroupId || dest, 'Me', sentText, sent.timestamp || timestamp);
-                        }
-                    }
-                } catch {}
-            });
-        }
-
-        // Build chat list
-        let store = {};
-        try {
-            if (fs.existsSync(MSG_STORE_FILE)) {
-                store = JSON.parse(fs.readFileSync(MSG_STORE_FILE, 'utf8'));
-            }
-        } catch {}
-
-        const chatList = [];
-        const allIds = new Set([...Object.keys(contactMap), ...Object.keys(store)]);
-
-        allIds.forEach(id => {
-            const lastTimestamp = store[id]?.[store[id].length - 1]?.timestamp || 1;
-            chatList.push({
-                identifier: id,
-                displayName: sanitizeText(contactMap[id] || id).substring(0, 15),
-                timestamp: lastTimestamp
-            });
-        });
-
-        chatList.sort((a, b) => b.timestamp - a.timestamp);
-        fs.writeFileSync(CACHE_FILE, JSON.stringify(chatList, null, 2));
-
-    } catch (err) {
-        console.error('[Cache] Background error:', err.message);
-    } finally {
-        isUpdatingCache = false;
+app.post('/login', (req, res) => {
+    const now = Date.now();
+    while (failedLogins.length && failedLogins[0] < now - 10 * 60000) failedLogins.shift();
+    if (failedLogins.length >= 5) {
+        return sendDeck(res, 'Login', 'Too many attempts. Try again later.');
     }
+    if (!passwordOk(req.body.pwd)) {
+        failedLogins.push(now);
+        return sendDeck(res, 'Login', 'Wrong password.<br/>' + a('/', 'Retry'));
+    }
+    req.session = newSession();
+    // The onevent clears the typed password from the phone's WML variables.
+    sendDeck(res, 'Signal', a(link(req, '/chats'), 'Open chats'),
+        '<onevent type="onenterforward"><refresh><setvar name="pwd" value=""/></refresh></onevent>');
+});
+
+function chatList() {
+    return Object.keys(store)
+        .filter(id => store[id].length)
+        .map(id => {
+            const last = store[id][store[id].length - 1];
+            return { id, ts: last.timestamp, unread: last.senderId !== 'Me' && last.timestamp > (state.lastRead[id] || 0) };
+        })
+        .sort((x, y) => y.ts - x.ts);
 }
 
-// Start background sync
-updateChatsCache();
-setInterval(updateChatsCache, 20000);
+app.get('/chats', auth, (req, res) => {
+    const page = Math.max(0, parseInt(req.query.p || '0', 10) || 0);
+    const all = chatList();
+    const items = all.slice(page * CHATS_PER_PAGE, (page + 1) * CHATS_PER_PAGE);
 
-// ==================== Routes ====================
+    let body = items.map(c =>
+        (c.unread ? '*' : '') + a(link(req, '/m', { c: shortId(c.id) }), esc(displayName(c.id).substring(0, NAME_LEN)))
+    ).join('<br/>') || 'No chats yet.';
 
-app.get('/', (req, res) => {
-    res.setHeader('Content-Type', 'text/vnd.wap.wml');
-    res.send(`<?xml version="1.0"?><!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml"><wml><card id="login" title="Signal Login"><p><strong>Password:</strong><br/><input name="pwd" type="password" format="*M"/><br/><anchor>Sign In<go href="/chats" method="post"><postfield name="pwd" value="$pwd"/></go></anchor></p></card></wml>`);
+    const nav = [];
+    if (page > 0) nav.push(a(link(req, '/chats', { p: page - 1 }), '&lt;Prev'));
+    if (all.length > (page + 1) * CHATS_PER_PAGE) nav.push(a(link(req, '/chats', { p: page + 1 }), 'More&gt;'));
+    if (nav.length) body += '<br/>' + nav.join(' ');
+
+    body += '<br/>' + a(link(req, '/find'), 'Contacts') + ' ' + a(link(req, '/chats', { t: Date.now() % 1000 }), 'Refresh');
+    sendDeck(res, 'Chats', body);
 });
 
-app.all('/chats', checkAuth, async (req, res) => {
-    res.setHeader('Content-Type', 'text/vnd.wap.wml');
-    let chats = [];
-    try {
-        if (fs.existsSync(CACHE_FILE)) {
-            chats = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+app.get('/find', auth, (req, res) => {
+    sendDeck(res, 'Search',
+        'Name or number:<br/><input name="q" emptyok="true"/><br/>' +
+        `<anchor>Search<go href="/search" method="get"><postfield name="s" value="${esc(req.session)}"/>` +
+        '<postfield name="q" value="$(q)"/></go></anchor>');
+});
+
+app.get('/search', auth, (req, res) => {
+    const q = ascii(req.query.q || '').toLowerCase();
+    const page = Math.max(0, parseInt(req.query.p || '0', 10) || 0);
+    const hits = Object.keys(contacts)
+        .filter(id => !q || contacts[id].toLowerCase().includes(q) || id.toLowerCase().includes(q))
+        .sort((x, y) => contacts[x].localeCompare(contacts[y], 'de', { sensitivity: 'base' }));
+    const items = hits.slice(page * CHATS_PER_PAGE, (page + 1) * CHATS_PER_PAGE);
+
+    let body = `${hits.length} found<br/>` +
+        items.map(id => a(link(req, '/m', { c: shortId(id) }), esc(contacts[id].substring(0, NAME_LEN)))).join('<br/>');
+    const nav = [];
+    if (page > 0) nav.push(a(link(req, '/search', { q, p: page - 1 }), '&lt;Prev'));
+    if (hits.length > (page + 1) * CHATS_PER_PAGE) nav.push(a(link(req, '/search', { q, p: page + 1 }), 'More&gt;'));
+    if (nav.length) body += '<br/>' + nav.join(' ');
+    body += '<br/>' + a(link(req, '/chats'), 'Chats');
+    sendDeck(res, 'Contacts', body);
+});
+
+function chatFrom(req, res) {
+    const id = longIds[req.query.c || req.body?.c];
+    if (!id) {
+        sendDeck(res, 'Error', 'Unknown chat.<br/>' + a(link(req, '/chats'), 'Chats'));
+        return null;
+    }
+    return id;
+}
+
+function fullText(m) {
+    return (m.q ? `[Re ${displayName(m.q.a).substring(0, 8)}: ${m.q.t}]\n` : '') + ascii(m.text);
+}
+
+// Messages, newest first, as many as fit in the deck budget.
+app.get('/m', auth, (req, res) => {
+    const id = chatFrom(req, res);
+    if (!id) return;
+    const c = shortId(id);
+    const msgs = store[id] || [];
+    const start = Math.max(0, parseInt(req.query.o || '0', 10) || 0);   // how many newest to skip
+    const isGroup = groupIds.has(id) || !(id.startsWith('+') || UUID_RE.test(id));
+
+    if (msgs.length) {
+        state.lastRead[id] = Math.max(state.lastRead[id] || 0, msgs[msgs.length - 1].timestamp);
+        scheduleSave();
+    }
+
+    let body = a(link(req, '/w', { c }), '[Write]') + '<br/>';
+    let used = 0;
+    let shown = 0;
+    for (let i = msgs.length - 1 - start; i >= 0; i--) {
+        const m = msgs[i];
+        const who = m.senderId === 'Me' ? 'Me' : (isGroup ? displayName(m.senderId).substring(0, 8) : '');
+        const head = `${who ? who + ' ' : ''}${fmtTime(m.timestamp)}`;
+        let text = fullText(m);
+        const room = TEXT_BUDGET - used - head.length;
+        if (shown > 0 && room < Math.min(text.length, 80)) break;
+        let more = '';
+        if (text.length > Math.max(room, 80)) {
+            text = text.substring(0, Math.max(room, 80));
+            more = ' ' + a(link(req, '/r', { c, t: m.timestamp, x: text.length }), '[more]');
         }
-    } catch {}
+        body += `<b>${esc(head)}</b><br/>${escLines(text)}${more}<br/>`;
+        used += head.length + text.length;
+        shown++;
+    }
+    if (!msgs.length) body += 'No messages.<br/>';
 
-    const list = chats.slice(0, 10).map(c => `<a href="/messages?id=${encodeURIComponent(c.identifier)}">${c.displayName}</a><br/>`).join('');
-    res.send(`<?xml version="1.0"?><!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml"><wml><card id="chats" title="Signal Chats"><p><strong>Search:</strong><br/><input name="q"/><br/><anchor>Search<go href="/search" method="get"><postfield name="q" value="$q"/></go></anchor><br/><br/><strong>Recent Chats:</strong><br/>${list || '<em>No chats found.</em>'}<br/><br/><anchor>&#xab; Logout<go href="/" method="get"/></anchor></p></card></wml>`);
+    const older = start + shown;
+    if (older < msgs.length) body += a(link(req, '/m', { c, o: older }), 'Older&gt;') + '<br/>';
+    body += a(link(req, '/chats'), 'Chats');
+    sendDeck(res, displayName(id).substring(0, NAME_LEN), body);
 });
 
-app.get('/search', checkAuth, async (req, res) => {
-    res.setHeader('Content-Type', 'text/vnd.wap.wml');
-    const query = (req.query.q || '').toLowerCase().trim();
-    const page = parseInt(req.query.page || '0', 10);
-    const pageSize = 10;
+// Read one long message in chunks.
+app.get('/r', auth, (req, res) => {
+    const id = chatFrom(req, res);
+    if (!id) return;
+    const c = shortId(id);
+    const t = Number(req.query.t);
+    const m = (store[id] || []).find(x => x.timestamp === t);
+    if (!m) return sendDeck(res, 'Error', 'Message gone.<br/>' + a(link(req, '/m', { c }), 'Back'));
+    const text = fullText(m);
+    const off = Math.max(0, parseInt(req.query.x || '0', 10) || 0);
+    let body = escLines(text.substring(off, off + TEXT_BUDGET)) + '<br/>';
+    if (off + TEXT_BUDGET < text.length) body += a(link(req, '/r', { c, t, x: off + TEXT_BUDGET }), '[more]') + '<br/>';
+    body += a(link(req, '/m', { c }), 'Chat');
+    sendDeck(res, 'Message', body);
+});
 
-    let contactMap = {};
+// Compose. The onenterforward event empties the field each time the card is opened,
+// so the previous message is not pre-filled.
+app.get('/w', auth, (req, res) => {
+    const id = chatFrom(req, res);
+    if (!id) return;
+    const c = shortId(id);
+    sendDeck(res, 'To ' + displayName(id).substring(0, NAME_LEN),
+        '<input name="msg" maxlength="500" emptyok="false"/><br/>' +
+        `<anchor>Send<go href="/send" method="post"><postfield name="s" value="${esc(req.session)}"/>` +
+        `<postfield name="c" value="${c}"/><postfield name="msg" value="$(msg)"/></go></anchor><br/>` +
+        a(link(req, '/m', { c }), 'Cancel'),
+        '<onevent type="onenterforward"><refresh><setvar name="msg" value=""/></refresh></onevent>');
+});
+
+app.post('/send', auth, async (req, res) => {
+    const id = chatFrom(req, res);
+    if (!id) return;
+    const c = shortId(id);
+    const text = String(req.body.msg || '').trim();
+    if (!text) return sendDeck(res, 'Error', 'Empty message.<br/>' + a(link(req, '/w', { c }), 'Back'));
+
+    const isGroup = groupIds.has(id) || !(id.startsWith('+') || UUID_RE.test(id));
+    const params = isGroup ? { groupId: id, message: text } : { recipient: [id], message: text };
     try {
-        if (fs.existsSync(CONTACTS_CACHE_FILE)) {
-            contactMap = JSON.parse(fs.readFileSync(CONTACTS_CACHE_FILE, 'utf8'));
-        }
-    } catch {}
-
-    let allEntries = Object.keys(contactMap).map(id => ({ identifier: id, displayName: contactMap[id] })).filter(c => !query || c.displayName.toLowerCase().includes(query) || c.identifier.toLowerCase().includes(query)).sort((a, b) => a.displayName.localeCompare(b.displayName, 'en', { sensitivity: 'base' }));
-
-    const startIndex = page * pageSize;
-    const endIndex = startIndex + pageSize;
-    const pageEntries = allEntries.slice(startIndex, endIndex);
-
-    let wml = `<?xml version="1.0"?><!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml"><wml><card id="searchres" title="Contacts"><p><strong>Results (${allEntries.length}):</strong><br/>`;
-    pageEntries.forEach(c => {
-        wml += `<a href="/messages?id=${encodeURIComponent(c.identifier)}">${c.displayName.substring(0, 15)}</a><br/>`;
-    });
-    wml += `<br/>${page > 0 ? `<anchor>&lt;&lt; Back<go href="/search" method="get"><postfield name="q" value="${query}"/><postfield name="page" value="${page - 1}"/></go></anchor> ` : ''}${endIndex < allEntries.length ? `<anchor>Next &gt;&gt;<go href="/search" method="get"><postfield name="q" value="${query}"/><postfield name="page" value="${page + 1}"/></go></anchor>` : ''}<br/><br/><anchor>&#xab; Main Menu<go href="/chats" method="get"/></anchor></p></card></wml>`;
-    res.send(wml);
-});
-
-app.get('/messages', checkAuth, async (req, res) => {
-    res.setHeader('Content-Type', 'text/vnd.wap.wml');
-    const contactId = req.query.id;
-
-    let store = {};
-    try {
-        if (fs.existsSync(MSG_STORE_FILE)) {
-            store = JSON.parse(fs.readFileSync(MSG_STORE_FILE, 'utf8'));
-        }
-    } catch {}
-
-    const messages = store[contactId] || [];
-    const msgs = messages.slice(-5).reverse().map(m => {
-        const sender = m.senderId === 'Me' ? 'Me' : sanitizeText(getResolvedName(m.senderId)).substring(0, 8);
-        const time = new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        return `<u>${sender} ${time}</u><br/>${sanitizeText(m.text).substring(0, 200)}<br/><br/>`;
-    }).join('');
-
-    res.send(`<?xml version="1.0"?><!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml"><wml><card id="msgs" title="Chat"><p><a href="/compose?id=${encodeURIComponent(contactId)}">[ Write ]</a><br/><br/>${msgs || '<em>No messages in history.</em>'}<br/><br/><anchor>&#xab; Back<go href="/chats" method="get"/></anchor></p></card></wml>`);
-});
-
-app.get('/compose', checkAuth, (req, res) => {
-    res.setHeader('Content-Type', 'text/vnd.wap.wml');
-    const contactId = req.query.id;
-    res.send(`<?xml version="1.0"?><!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml"><wml><card id="compose" title="Reply"><p><strong>Message:</strong><br/><input name="msg"/><br/><anchor>Send<go href="/send" method="post"><postfield name="id" value="${contactId}"/><postfield name="msg" value="$msg"/></go></anchor><br/><anchor>&#xab; Cancel<go href="/messages?id=${encodeURIComponent(contactId)}" method="get"/></anchor></p></card></wml>`);
-});
-
-app.post('/send', checkAuth, async (req, res) => {
-    res.setHeader('Content-Type', 'text/vnd.wap.wml');
-    const targetId = req.body.id;
-    const messageText = req.body.msg;
-
-    try {
-        const safeText = messageText.replace(/"/g, '\\"');
-        let sendCmd = targetId.startsWith('+') || targetId.length === 36
-            ? `signal-cli send -m "${safeText}" "${targetId}"`
-            : `signal-cli send -m "${safeText}" -g "${targetId}"`;
-
-        await runSignalCli(sendCmd);
-        storeMessage(targetId, 'Me', messageText, Date.now());
-
-        res.send(`<?xml version="1.0"?><!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml"><wml><card id="sent" title="Sent"><p>Message sent!<br/><br/><anchor>&#xab; Back<go href="/messages?id=${encodeURIComponent(targetId)}" method="get"/></anchor></p></card></wml>`);
-    } catch {
-        res.send(`<?xml version="1.0"?><!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml"><wml><card id="err" title="Error"><p>Failed to send!<br/><br/><anchor>Back<go href="/messages?id=${encodeURIComponent(targetId)}" method="get"/></anchor></p></card></wml>`);
+        const result = await signal.call('send', params);
+        storeMessage(id, 'Me', text, result?.timestamp || Date.now());
+        sendDeck(res, 'Sent', 'Sent.<br/>' + a(link(req, '/m', { c }), 'Chat'));
+    } catch (e) {
+        console.error('[send]', e.message);
+        sendDeck(res, 'Error', 'Send failed.<br/>' + a(link(req, '/w', { c }), 'Retry') + ' ' + a(link(req, '/m', { c }), 'Chat'));
     }
 });
 
 // ==================== Server ====================
 
-app.listen(PORT, '127.0.0.1', () => {
-    console.log(`Signal WML running on http://127.0.0.1:${PORT}`);
+signal.start();
+app.listen(PORT, HOST, () => {
+    console.log(`Signal WAP running on http://${HOST}:${PORT}`);
 });
+
+function shutdown() {
+    try { saveJson(MSG_STORE_FILE, store); saveJson(STATE_FILE, state); } catch {}
+    process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
