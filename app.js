@@ -55,7 +55,7 @@ function saveJson(file, data) {
 // messages_store.json keeps the original format: { chatId: [{senderId, text, timestamp}] }
 const store = loadJson(MSG_STORE_FILE, {});
 const state = Object.assign(
-    { shortIds: {}, nextShortId: 1, lastRead: {}, sessions: {} },
+    { shortIds: {}, nextShortId: 1, lastRead: {}, sessions: {}, names: {} },
     loadJson(STATE_FILE, {})
 );
 const longIds = {};
@@ -88,7 +88,8 @@ function shortId(id) {
 
 // ==================== Contacts ====================
 
-const contacts = {};      // id -> display name
+// id -> display name. Persisted so names are there right after a restart.
+const contacts = state.names;
 const uuidToNumber = {};  // uuid -> phone number
 const groupIds = new Set();
 
@@ -105,7 +106,8 @@ function displayName(id) {
     if (id === 'Me') return 'Me';
     const n = contacts[id] || contacts[canonical(id)];
     if (n) return n;
-    return id.length > 12 ? id.substring(0, 8) + '..' : id;
+    if (id.startsWith('+')) return id;
+    return id.substring(0, 6) + '..';
 }
 
 // Messages that arrived before the contact list was loaded may sit under a uuid.
@@ -136,23 +138,35 @@ function mergeAliases() {
     scheduleSave();
 }
 
+function nameOf(c) {
+    const join = (...p) => p.filter(Boolean).join(' ').trim();
+    return c.nickName
+        || join(c.nickGivenName, c.nickFamilyName)
+        || c.name
+        || join(c.givenName, c.familyName)
+        || join(c.profile?.givenName, c.profile?.familyName)
+        || c.profileName
+        || c.username
+        || '';
+}
+
 async function refreshContacts() {
     try {
-        const list = await signal.call('listContacts', {});
+        // allRecipients also lists people who are not in the address book
+        // (group members, message requests), so they get a name too.
+        const list = await signal.call('listContacts', { allRecipients: true })
+            .catch(() => signal.call('listContacts', {}));
         if (Array.isArray(list)) {
             for (const c of list) {
                 const uuid = c.uuid || c.aci;
                 if (uuid && c.number) uuidToNumber[uuid] = c.number;
-                const name = c.name
-                    || [c.givenName, c.familyName].filter(Boolean).join(' ')
-                    || [c.profile?.givenName, c.profile?.familyName].filter(Boolean).join(' ')
-                    || c.profileName
-                    || c.username;
+                const name = phoneText(nameOf(c));
                 const id = c.number || uuid;
-                if (id && name) contacts[id] = phoneText(name);
+                if (id && name) contacts[id] = name;
             }
         }
         mergeAliases();
+        scheduleSave();
     } catch (e) {
         console.error('[Contacts]', e.message || e);
     }
@@ -276,6 +290,15 @@ function handleEnvelope(env) {
     const source = canonical(env.sourceNumber || env.sourceUuid || env.source) || 'Unknown';
     const ts = env.timestamp || Date.now();
 
+    // Every message carries the sender's profile name; use it for people
+    // signal-cli has no contact entry for yet.
+    if (env.sourceUuid && env.sourceNumber) uuidToNumber[env.sourceUuid] = env.sourceNumber;
+    const profileName = phoneText(env.sourceName || '');
+    if (source !== 'Unknown' && profileName && !contacts[source]) {
+        contacts[source] = profileName;
+        scheduleSave();
+    }
+
     const dm = env.dataMessage || env.editMessage?.dataMessage;
     if (dm && !dm.reaction && !dm.remoteDelete) {
         const text = describe(dm);
@@ -398,6 +421,14 @@ function passwordOk(pwd) {
 
 const HEAD = '<?xml version="1.0" encoding="ISO-8859-1"?>\n<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">\n';
 
+// A paragraph: a string, or { text, align, mode } for centered/nowrap lines.
+function para(p) {
+    if (typeof p === 'string') return `<p>${p}</p>`;
+    const attrs = (p.align ? ` align="${p.align}"` : '') + (p.mode ? ` mode="${p.mode}"` : '');
+    return `<p${attrs}>${p.text}</p>`;
+}
+
+// body: one paragraph or an array of them.
 function sendDeck(res, title, body, extra = '') {
     res.set({
         'Content-Type': 'text/vnd.wap.wml; charset=ISO-8859-1',
@@ -410,7 +441,8 @@ function sendDeck(res, title, body, extra = '') {
         '<wml><head><meta http-equiv="Cache-Control" content="max-age=0" forua="true"/></head>' +
         `<card id="c" title="${esc(title)}">${extra}` +
         '<do type="prev" label="Back"><prev/></do>' +
-        `<p>${body}</p></card></wml>`,
+        (Array.isArray(body) ? body : [body]).map(para).join('') +
+        '</card></wml>',
         'latin1'
     ));
 }
@@ -476,26 +508,32 @@ function auth(req, res, next) {
     next();
 }
 
+const LOGIN_GO = '<go href="/login" method="post"><postfield name="pwd" value="$(pwd)"/></go>';
+
 app.get('/', (req, res) => {
-    sendDeck(res, 'Signal',
-        'Password:<br/><input name="pwd" type="password" format="*M" emptyok="false"/><br/>' +
-        '<anchor>Sign in<go href="/login" method="post"><postfield name="pwd" value="$(pwd)"/></go></anchor>');
+    sendDeck(res, 'Signal WAP', [
+        'Password:<br/><input name="pwd" type="password" title="Password" emptyok="false"/>',
+        `<br/><anchor>&gt; Login${LOGIN_GO}</anchor>`,
+    ], `<do type="accept" label="Login">${LOGIN_GO}</do>`);
 });
 
 app.post('/login', (req, res) => {
     const now = Date.now();
     while (failedLogins.length && failedLogins[0] < now - 10 * 60000) failedLogins.shift();
     if (failedLogins.length >= 5) {
-        return sendDeck(res, 'Login', 'Too many attempts. Try again later.');
+        return sendDeck(res, 'Locked', 'Too many attempts.<br/>Try again in 10 min.');
     }
     if (!passwordOk(req.form.pwd)) {
         failedLogins.push(now);
-        return sendDeck(res, 'Login', 'Wrong password.<br/>' + a('/', 'Retry'));
+        return sendDeck(res, 'Wrong password', ['Please try again.', '<br/>' + a('/', '&gt; Back')]);
     }
     req.session = newSession();
     // The onevent clears the typed password from the phone's WML variables.
-    sendDeck(res, 'Signal', a(link(req, '/chats'), 'Open chats'),
-        '<onevent type="onenterforward"><refresh><setvar name="pwd" value=""/></refresh></onevent>');
+    // A short timer forwards to the chat list on its own.
+    const chats = link(req, '/chats');
+    sendDeck(res, 'Logged in', a(chats, '&gt; Chats'),
+        '<onevent type="onenterforward"><refresh><setvar name="pwd" value=""/></refresh></onevent>' +
+        `<onevent type="ontimer"><go href="${chats}"/></onevent><timer value="10"/>`);
 });
 
 function chatList() {
@@ -522,7 +560,7 @@ app.get('/chats', auth, (req, res) => {
     if (all.length > (page + 1) * CHATS_PER_PAGE) nav.push(a(link(req, '/chats', { p: page + 1 }), 'More&gt;'));
     if (nav.length) body += '<br/>' + nav.join(' ');
 
-    body += '<br/>' + a(link(req, '/find'), 'Contacts') + ' ' + a(link(req, '/chats', { t: Date.now() % 1000 }), 'Refresh');
+    body += '<br/><br/>' + a(link(req, '/find'), 'Contacts') + ' | ' + a(link(req, '/chats', { t: Date.now() % 1000 }), 'Refresh');
     sendDeck(res, 'Chats', body);
 });
 
@@ -578,7 +616,7 @@ app.get('/m', auth, (req, res) => {
         scheduleSave();
     }
 
-    let body = a(link(req, '/w', { c }), '[Write]') + '<br/>';
+    let body = a(link(req, '/w', { c }), '&gt; Write') + '<br/>';
     let used = 0;
     let shown = 0;
     for (let i = msgs.length - 1 - start; i >= 0; i--) {
@@ -593,14 +631,15 @@ app.get('/m', auth, (req, res) => {
             text = text.substring(0, Math.max(room, 80));
             more = ' ' + a(link(req, '/r', { c, t: m.timestamp, x: text.length }), '[more]');
         }
-        body += `<b>${esc(head)}</b><br/>${escLines(text)}${more}<br/>`;
+        body += `<br/><b>${esc(head)}</b><br/>${escLines(text)}${more}<br/>`;
         used += head.length + text.length;
         shown++;
     }
-    if (!msgs.length) body += 'No messages.<br/>';
+    if (!msgs.length) body += '<br/>No messages.<br/>';
 
     const older = start + shown;
-    if (older < msgs.length) body += a(link(req, '/m', { c, o: older }), 'Older&gt;') + '<br/>';
+    body += '<br/>';
+    if (older < msgs.length) body += a(link(req, '/m', { c, o: older }), 'Older&gt;') + ' | ';
     body += a(link(req, '/chats'), 'Chats');
     sendDeck(res, displayName(id).substring(0, NAME_LEN), body);
 });
