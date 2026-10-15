@@ -149,7 +149,7 @@ async function refreshContacts() {
                     || c.profileName
                     || c.username;
                 const id = c.number || uuid;
-                if (id && name) contacts[id] = ascii(name);
+                if (id && name) contacts[id] = phoneText(name);
             }
         }
         mergeAliases();
@@ -162,7 +162,7 @@ async function refreshContacts() {
             for (const g of groups) {
                 if (!g.id) continue;
                 groupIds.add(g.id);
-                contacts[g.id] = '#' + ascii(g.name || 'Group');
+                contacts[g.id] = '#' + phoneText(g.name || 'Group');
             }
         }
     } catch (e) {
@@ -172,28 +172,45 @@ async function refreshContacts() {
 
 // ==================== Text helpers ====================
 
+// Characters outside ISO-8859-1 that have a sensible stand-in.
 const CHAR_MAP = {
-    'ä': 'ae', 'ö': 'oe', 'ü': 'ue', 'Ä': 'Ae', 'Ö': 'Oe', 'Ü': 'Ue', 'ß': 'ss',
     '€': 'EUR', '„': '"', '“': '"', '”': '"', '‘': "'", '’': "'", '‚': "'",
-    '–': '-', '—': '-', '…': '...', ' ': ' ',
+    '–': '-', '—': '-', '…': '...', '•': '*',
     '😂': ':D', '🤣': ':D', '😀': ':D', '😃': ':D', '😄': ':D', '😁': ':D',
     '🙂': ':)', '😊': ':)', '☺': ':)', '😉': ';)', '😢': ":'(", '😭': ":'(",
     '🙁': ':(', '☹': ':(', '😛': ':P', '😜': ';P', '😮': ':O', '😘': ':*',
     '❤': '<3', '♥': '<3', '👍': '(y)', '👎': '(n)', '🙏': '(pray)',
 };
 const CHAR_RE = new RegExp(Object.keys(CHAR_MAP).join('|'), 'gu');
+const LATIN1_RE = /^[\x20-\x7E\xA0-\xFF\n]$/;
 
-// The 7110 only renders plain ASCII reliably.
-function ascii(text) {
+// The 7110 shows ISO-8859-1 (umlauts, ß, é, ...). Everything else is mapped,
+// stripped of its accent (č -> c) or replaced with '?'.
+function phoneText(text) {
     if (text == null) return '';
-    return String(text)
+    const out = [];
+    for (const ch of String(text)
         .replace(/[︎️‍]/g, '')
         .replace(CHAR_RE, c => CHAR_MAP[c])
-        .normalize('NFD')
-        .replace(/[̀-ͯ]/g, '')
         .replace(/\r\n?/g, '\n')
-        .replace(/[^\x20-\x7E\n]+/gu, '?')
-        .trim();
+        .replace(/\t/g, ' ')
+        .normalize('NFC')) {
+        if (LATIN1_RE.test(ch)) { out.push(ch); continue; }
+        const base = ch.normalize('NFD').replace(/[̀-ͯ]/g, '');
+        out.push(base && [...base].every(c => LATIN1_RE.test(c)) ? base : '?');
+    }
+    return out.join('').replace(/\?{2,}/g, '?').trim();
+}
+
+function plain(text) {
+    return phoneText(text).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/ß/g, 'ss');
+}
+
+// For search: "mueller", "müller" and "muller" all find Müller.
+function fold(text) {
+    return phoneText(text).toLowerCase()
+        .replace(/ä/g, 'ae').replace(/ö/g, 'oe').replace(/ü/g, 'ue').replace(/ß/g, 'ss')
+        .normalize('NFD').replace(/[̀-ͯ]/g, '');
 }
 
 // Escape for WML text and attributes. `$` starts a WML variable, so it is doubled.
@@ -238,7 +255,7 @@ function quoteOf(dm) {
     if (!dm.quote) return undefined;
     return {
         a: canonical(dm.quote.authorNumber || dm.quote.authorUuid || dm.quote.author),
-        t: ascii(dm.quote.text || '').substring(0, 20),
+        t: phoneText(dm.quote.text || '').substring(0, 20),
     };
 }
 
@@ -379,22 +396,23 @@ function passwordOk(pwd) {
 
 // ==================== WML ====================
 
-const HEAD = '<?xml version="1.0"?>\n<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">\n';
+const HEAD = '<?xml version="1.0" encoding="ISO-8859-1"?>\n<!DOCTYPE wml PUBLIC "-//WAPFORUM//DTD WML 1.1//EN" "http://www.wapforum.org/DTD/wml_1.1.xml">\n';
 
 function sendDeck(res, title, body, extra = '') {
     res.set({
-        'Content-Type': 'text/vnd.wap.wml',
+        'Content-Type': 'text/vnd.wap.wml; charset=ISO-8859-1',
         'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Pragma': 'no-cache',
         'Expires': '0',
     });
-    res.send(
+    res.send(Buffer.from(
         HEAD +
         '<wml><head><meta http-equiv="Cache-Control" content="max-age=0" forua="true"/></head>' +
         `<card id="c" title="${esc(title)}">${extra}` +
         '<do type="prev" label="Back"><prev/></do>' +
-        `<p>${body}</p></card></wml>`
-    );
+        `<p>${body}</p></card></wml>`,
+        'latin1'
+    ));
 }
 
 // Build a URL with the session token; `&` is escaped for WML.
@@ -410,10 +428,47 @@ function a(href, label) {
 // ==================== App ====================
 
 const app = express();
-app.use(express.urlencoded({ extended: false }));
+// The phone sends form data in the deck's charset (ISO-8859-1), but a gateway may
+// have converted it to UTF-8. Decode as UTF-8 when valid, otherwise as Latin-1.
+const utf8 = new TextDecoder('utf-8', { fatal: true });
+
+function decodeBytes(buf) {
+    try { return utf8.decode(buf); } catch { return buf.toString('latin1'); }
+}
+
+function parseForm(str, into) {
+    for (const pair of String(str || '').split('&')) {
+        if (!pair) continue;
+        const eq = pair.indexOf('=');
+        const raw = [eq < 0 ? pair : pair.slice(0, eq), eq < 0 ? '' : pair.slice(eq + 1)];
+        const [k, v] = raw.map(x => decodeBytes(Buffer.from(
+            x.replace(/\+/g, ' ').replace(/%([0-9a-f]{2})/gi, (_, h) => String.fromCharCode(parseInt(h, 16))),
+            'latin1')));
+        into[k] = v;
+    }
+    return into;
+}
+
+app.use((req, res, next) => {
+    req.form = {};
+    const qi = req.url.indexOf('?');
+    if (qi >= 0) parseForm(req.url.slice(qi + 1), req.form);
+    if (req.method !== 'POST') return next();
+    const chunks = [];
+    let size = 0;
+    req.on('data', c => {
+        size += c.length;
+        if (size > 16384) { req.destroy(); return; }
+        chunks.push(c);
+    });
+    req.on('end', () => {
+        parseForm(Buffer.concat(chunks).toString('latin1'), req.form);
+        next();
+    });
+});
 
 function auth(req, res, next) {
-    const token = req.query.s || req.body?.s;
+    const token = req.form.s;
     if (!validSession(token)) {
         return sendDeck(res, 'Login', 'Session expired.<br/>' + a('/', 'Login'));
     }
@@ -433,7 +488,7 @@ app.post('/login', (req, res) => {
     if (failedLogins.length >= 5) {
         return sendDeck(res, 'Login', 'Too many attempts. Try again later.');
     }
-    if (!passwordOk(req.body.pwd)) {
+    if (!passwordOk(req.form.pwd)) {
         failedLogins.push(now);
         return sendDeck(res, 'Login', 'Wrong password.<br/>' + a('/', 'Retry'));
     }
@@ -454,7 +509,7 @@ function chatList() {
 }
 
 app.get('/chats', auth, (req, res) => {
-    const page = Math.max(0, parseInt(req.query.p || '0', 10) || 0);
+    const page = Math.max(0, parseInt(req.form.p || '0', 10) || 0);
     const all = chatList();
     const items = all.slice(page * CHATS_PER_PAGE, (page + 1) * CHATS_PER_PAGE);
 
@@ -479,25 +534,25 @@ app.get('/find', auth, (req, res) => {
 });
 
 app.get('/search', auth, (req, res) => {
-    const q = ascii(req.query.q || '').toLowerCase();
-    const page = Math.max(0, parseInt(req.query.p || '0', 10) || 0);
+    const q = fold(req.form.q || '');
+    const page = Math.max(0, parseInt(req.form.p || '0', 10) || 0);
     const hits = Object.keys(contacts)
-        .filter(id => !q || contacts[id].toLowerCase().includes(q) || id.toLowerCase().includes(q))
+        .filter(id => !q || fold(contacts[id]).includes(q) || plain(contacts[id]).includes(q) || id.toLowerCase().includes(q))
         .sort((x, y) => contacts[x].localeCompare(contacts[y], 'de', { sensitivity: 'base' }));
     const items = hits.slice(page * CHATS_PER_PAGE, (page + 1) * CHATS_PER_PAGE);
 
     let body = `${hits.length} found<br/>` +
         items.map(id => a(link(req, '/m', { c: shortId(id) }), esc(contacts[id].substring(0, NAME_LEN)))).join('<br/>');
     const nav = [];
-    if (page > 0) nav.push(a(link(req, '/search', { q, p: page - 1 }), '&lt;Prev'));
-    if (hits.length > (page + 1) * CHATS_PER_PAGE) nav.push(a(link(req, '/search', { q, p: page + 1 }), 'More&gt;'));
+    if (page > 0) nav.push(a(link(req, '/search', { q: req.form.q || '', p: page - 1 }), '&lt;Prev'));
+    if (hits.length > (page + 1) * CHATS_PER_PAGE) nav.push(a(link(req, '/search', { q: req.form.q || '', p: page + 1 }), 'More&gt;'));
     if (nav.length) body += '<br/>' + nav.join(' ');
     body += '<br/>' + a(link(req, '/chats'), 'Chats');
     sendDeck(res, 'Contacts', body);
 });
 
 function chatFrom(req, res) {
-    const id = longIds[req.query.c || req.body?.c];
+    const id = longIds[req.form.c];
     if (!id) {
         sendDeck(res, 'Error', 'Unknown chat.<br/>' + a(link(req, '/chats'), 'Chats'));
         return null;
@@ -506,7 +561,7 @@ function chatFrom(req, res) {
 }
 
 function fullText(m) {
-    return (m.q ? `[Re ${displayName(m.q.a).substring(0, 8)}: ${m.q.t}]\n` : '') + ascii(m.text);
+    return (m.q ? `[Re ${displayName(m.q.a).substring(0, 8)}: ${m.q.t}]\n` : '') + phoneText(m.text);
 }
 
 // Messages, newest first, as many as fit in the deck budget.
@@ -515,7 +570,7 @@ app.get('/m', auth, (req, res) => {
     if (!id) return;
     const c = shortId(id);
     const msgs = store[id] || [];
-    const start = Math.max(0, parseInt(req.query.o || '0', 10) || 0);   // how many newest to skip
+    const start = Math.max(0, parseInt(req.form.o || '0', 10) || 0);   // how many newest to skip
     const isGroup = groupIds.has(id) || !(id.startsWith('+') || UUID_RE.test(id));
 
     if (msgs.length) {
@@ -555,11 +610,11 @@ app.get('/r', auth, (req, res) => {
     const id = chatFrom(req, res);
     if (!id) return;
     const c = shortId(id);
-    const t = Number(req.query.t);
+    const t = Number(req.form.t);
     const m = (store[id] || []).find(x => x.timestamp === t);
     if (!m) return sendDeck(res, 'Error', 'Message gone.<br/>' + a(link(req, '/m', { c }), 'Back'));
     const text = fullText(m);
-    const off = Math.max(0, parseInt(req.query.x || '0', 10) || 0);
+    const off = Math.max(0, parseInt(req.form.x || '0', 10) || 0);
     let body = escLines(text.substring(off, off + TEXT_BUDGET)) + '<br/>';
     if (off + TEXT_BUDGET < text.length) body += a(link(req, '/r', { c, t, x: off + TEXT_BUDGET }), '[more]') + '<br/>';
     body += a(link(req, '/m', { c }), 'Chat');
@@ -584,7 +639,7 @@ app.post('/send', auth, async (req, res) => {
     const id = chatFrom(req, res);
     if (!id) return;
     const c = shortId(id);
-    const text = String(req.body.msg || '').trim();
+    const text = String(req.form.msg || '').trim();
     if (!text) return sendDeck(res, 'Error', 'Empty message.<br/>' + a(link(req, '/w', { c }), 'Back'));
 
     const isGroup = groupIds.has(id) || !(id.startsWith('+') || UUID_RE.test(id));

@@ -25,7 +25,9 @@ second signal-cli (daemon or cron `receive`) for the same account at the same ti
 - No cookies needed: after login a short session token is carried in the links.
   Bookmark the chats page to skip the login (sessions last 30 days).
 - Chats are addressed by short numbers instead of 44-character Signal ids.
-- Umlauts and common emoji are turned into ASCII (`ae`, `:)`, `<3`, ...).
+- Pages are sent as ISO-8859-1, so umlauts, ß and accented letters show as they are.
+  Common emoji become `:)`, `:D`, `<3`, `(y)`; other characters the 7110 can't show become `?`.
+- Typed umlauts are accepted whether the gateway passes them as ISO-8859-1 or UTF-8.
 - Pages are sent with no-cache headers so the phone doesn't show stale chats.
 - New messages are marked with `*` in the chat list.
 
