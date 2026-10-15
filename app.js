@@ -656,10 +656,38 @@ app.post('/send', auth, async (req, res) => {
 
 // ==================== Server ====================
 
+const TLS_CERT = process.env.TLS_CERT || '';
+const TLS_KEY = process.env.TLS_KEY || '';
+
+function loadTls() {
+    return { cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) };
+}
+
 signal.start();
-app.listen(PORT, HOST, () => {
-    console.log(`Signal WAP running on http://${HOST}:${PORT}`);
-});
+
+if (TLS_CERT && TLS_KEY) {
+    const https = require('https');
+    const server = https.createServer({ ...loadTls(), minVersion: 'TLSv1.2' }, app);
+    server.listen(PORT, HOST, () => {
+        console.log(`Signal WAP running on https://${HOST}:${PORT}`);
+    });
+    // Pick up renewed certificates (e.g. Let's Encrypt) without a restart:
+    // every 12 hours, or right away on `kill -HUP`.
+    const reload = () => {
+        try {
+            server.setSecureContext(loadTls());
+            console.log('[TLS] certificate reloaded');
+        } catch (e) {
+            console.error('[TLS] reload failed:', e.message);
+        }
+    };
+    setInterval(reload, 12 * 3600 * 1000);
+    process.on('SIGHUP', reload);
+} else {
+    app.listen(PORT, HOST, () => {
+        console.log(`Signal WAP running on http://${HOST}:${PORT}`);
+    });
+}
 
 function shutdown() {
     try { saveJson(MSG_STORE_FILE, store); saveJson(STATE_FILE, state); } catch {}

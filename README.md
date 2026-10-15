@@ -15,6 +15,14 @@ Signal-CLI Bridge for WAP Browsers, tested on a Nokia 7110
 9. Run `npm start` to launch signal-wap
 10. Point your WAP gateway (e.g. Kannel) at `http://127.0.0.1:8082/` and open it on the phone
 
+### HTTPS
+Set `TLS_CERT` and `TLS_KEY` in `.env` (e.g. a Let's Encrypt certificate) and the app
+serves HTTPS instead of HTTP. The phone itself still talks WAP to the gateway; the
+gateway then fetches the pages over HTTPS. If the gateway runs on another machine,
+also set `HOST=0.0.0.0` (and preferably firewall the port to the gateway's address).
+Note: Let's Encrypt `privkey.pem` is only readable by root - give the user running
+signal-wap read access (e.g. via a group) instead of running it as root.
+
 signal-wap starts `signal-cli jsonRpc` itself and keeps it running, so don't run a
 second signal-cli (daemon or cron `receive`) for the same account at the same time.
 
@@ -33,5 +41,5 @@ second signal-cli (daemon or cron `receive`) for the same account at the same ti
 
 ## Notes
 - Messages are stored as plaintext JSON files (`messages_store.json`, `state.json`, mode 600)
-- No HTTPS support - traffic between phone and gateway is unencrypted
+- HTTPS is optional (see above); the WAP/GSM link between phone and gateway is not covered by it
 - Attachments are shown as `[Image]`, `[Voice]`, ... but cannot be opened
